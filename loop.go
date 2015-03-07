@@ -117,7 +117,7 @@ func one(c Client, inbox, pattern string, deliver DeliverFunc, outbox string) (i
 		}
 		n++
 
-		if err = c.Mark(uid, true); err != nil {
+		if err = c.MarkSeen(uid); err != nil {
 			Log.Error("mark seen", "uid", uid, "error", err)
 			continue
 		}

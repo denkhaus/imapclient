@@ -21,10 +21,12 @@ package imapclient
 import (
 	"crypto/tls"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/mxk/go-imap/imap"
 	"github.com/tgulacsi/go/loghlp"
 	"gopkg.in/inconshreveable/log15.v2"
@@ -45,6 +47,10 @@ func init() {
 	Log.SetHandler(log15.DiscardHandler())
 }
 
+func Inspect(args ...interface{}) {
+	spew.Dump(args)
+}
+
 // Client interface declares the needed methods for listing messages,
 // deleting and moving them around.
 type Client interface {
@@ -52,8 +58,13 @@ type Client interface {
 	Close(commit bool) error
 	ListNew(mbox, pattern string) ([]uint32, error)
 	ReadTo(w io.Writer, msgID uint32) (int64, error)
-	Mark(msgID uint32, seen bool) error
-	Delete(msgID uint32) error
+	GetFlags(msgID uint32) (imap.FlagSet, error)
+	SetFlag(msgID uint32, keyword string, st bool) error
+	SetFlagRegex(msgID uint32, regex string, st bool) error
+	MarkSeen(msgID uint32) error
+	MarkUnseen(msgID uint32) error
+	MarkDeleted(msgID uint32) error
+	MarkUndeleted(msgID uint32) error
 	Move(msgID uint32, mbox string) error
 	SetLogMask(mask imap.LogMask) imap.LogMask
 }
@@ -113,6 +124,7 @@ func (c client) ReadTo(w io.Writer, msgID uint32) (int64, error) {
 	var length int64
 	set := &imap.SeqSet{}
 	set.AddNum(msgID)
+
 	cmd, err := c.c.UIDFetch(set, "BODY.PEEK[]")
 	if err != nil {
 		return length, err
@@ -149,12 +161,49 @@ func (c client) ReadTo(w io.Writer, msgID uint32) (int64, error) {
 func (c client) Move(msgID uint32, mbox string) error {
 	set := &imap.SeqSet{}
 	set.AddNum(msgID)
-	_, err := imap.Wait(c.c.UIDCopy(set, mbox))
+
+	if _, err := imap.Wait(c.c.UIDCopy(set, mbox)); err != nil {
+		return err
+	}
+
+	return c.MarkDeleted(msgID)
+}
+
+// Get the Flags by MsgId.
+func (c *client) SetFlagRegex(msgID uint32, regex string, st bool) error {
+	flags, err := c.GetFlags(msgID)
 	if err != nil {
 		return err
 	}
-	_, err = imap.Wait(c.c.UIDStore(set, "+FLAGS", imap.Field(`\Deleted`)))
-	return err
+
+	rex := regexp.MustCompile(regex)
+	for flag := range flags {
+		if rex.MatchString(flag) {
+			if err := c.SetFlag(msgID, flag, st); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// Get the Flags by MsgId.
+func (c *client) GetFlags(msgID uint32) (imap.FlagSet, error) {
+	set := &imap.SeqSet{}
+	set.AddNum(msgID)
+
+	cmd, err := imap.Wait(c.c.UIDFetch(set, "FLAGS"))
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = cmd.Result(imap.OK); err != nil {
+		return nil, err
+	}
+
+	resp := cmd.Data[0].MessageInfo()
+	return resp.Flags, nil
 }
 
 // ListNew lists the new (UNSEEN) messages from the given mbox, matching the pattern.
@@ -215,23 +264,36 @@ func (c *client) Close(expunge bool) error {
 	return err
 }
 
-// Mark the message seen/unseed
-func (c *client) Mark(msgID uint32, seen bool) error {
-	set := &imap.SeqSet{}
-	set.AddNum(msgID)
-	item := "+FLAGS"
-	if !seen {
-		item = "-FLAGS"
-	}
-	_, err := imap.Wait(c.c.UIDStore(set, item, imap.Field(`\Seen`)))
-	return err
+// Mark the message seen
+func (c *client) MarkSeen(msgID uint32) error {
+	return c.SetFlag(msgID, `\Seen`, true)
 }
 
-// Delete the message
-func (c *client) Delete(msgID uint32) error {
+// Mark the message unseen
+func (c *client) MarkUnseen(msgID uint32) error {
+	return c.SetFlag(msgID, `\Seen`, false)
+}
+
+// Mark the message deleted
+func (c *client) MarkDeleted(msgID uint32) error {
+	return c.SetFlag(msgID, `\Deleted`, true)
+}
+
+// Mark the message undeleted
+func (c *client) MarkUndeleted(msgID uint32) error {
+	return c.SetFlag(msgID, `\Deleted`, false)
+}
+
+// Set the specified keyword
+func (c *client) SetFlag(msgID uint32, keyword string, st bool) error {
 	set := &imap.SeqSet{}
 	set.AddNum(msgID)
-	_, err := imap.Wait(c.c.UIDStore(set, "+FLAGS", imap.Field(`\Deleted`)))
+
+	item := "+FLAGS"
+	if !st {
+		item = "-FLAGS"
+	}
+	_, err := imap.Wait(c.c.UIDStore(set, item, imap.Field(keyword)))
 	return err
 }
 

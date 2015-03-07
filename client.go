@@ -56,7 +56,7 @@ func Inspect(args ...interface{}) {
 type Client interface {
 	Connect() error
 	Close(commit bool) error
-	ListNew(mbox, pattern string) ([]uint32, error)
+	List(mbox, pattern string, all bool) ([]uint32, error)
 	ReadTo(w io.Writer, msgID uint32) (int64, error)
 	GetFlags(msgID uint32) (imap.FlagSet, error)
 	SetFlag(msgID uint32, keyword string, st bool) error
@@ -80,6 +80,7 @@ type client struct {
 	port, tls                int
 	noUTF8                   bool
 	c                        *imap.Client
+	created                  []string
 }
 
 // NewClient returns a new (not connected) Client, using TLS iff port == 143.
@@ -158,7 +159,22 @@ func (c client) ReadTo(w io.Writer, msgID uint32) (int64, error) {
 }
 
 // Move the msgID to the given mbox.
-func (c client) Move(msgID uint32, mbox string) error {
+func (c *client) Move(msgID uint32, mbox string) error {
+	created := false
+	for _, k := range c.created {
+		if mbox == k {
+			created = true
+			break
+		}
+	}
+	if !created {
+		Log.Info("Create", "mbox", mbox)
+		c.created = append(c.created, mbox)
+		if _, err := imap.Wait(c.c.Create(mbox)); err != nil {
+			Log.Error("Create", "mbox", mbox, "error", err)
+		}
+	}
+
 	set := &imap.SeqSet{}
 	set.AddNum(msgID)
 
@@ -206,15 +222,20 @@ func (c *client) GetFlags(msgID uint32) (imap.FlagSet, error) {
 	return resp.Flags, nil
 }
 
-// ListNew lists the new (UNSEEN) messages from the given mbox, matching the pattern.
-func (c *client) ListNew(mbox, pattern string) ([]uint32, error) {
-	Log.Debug("ListNew", "mbox", mbox, "pattern", pattern)
+// List the messages from the given mbox, matching the pattern.
+// Lists only new (UNSEEN) messages iff all is false.
+func (c *client) List(mbox, pattern string, all bool) ([]uint32, error) {
+	Log.Debug("List", "mbox", mbox, "pattern", pattern)
 	_, err := imap.Wait(c.c.Select(mbox, false))
 	if err != nil {
 		return nil, err
 	}
-	var fields = make([]imap.Field, 1, 3)
-	fields[0] = imap.Field("UNSEEN")
+	var fields = make([]imap.Field, 0, 4)
+	if all {
+		fields = append(fields, imap.Field("NOT"), imap.Field("DELETED"))
+	} else {
+		fields = append(fields, imap.Field("UNSEEN"))
+	}
 	if pattern != "" {
 		fields = append(fields, imap.Field("SUBJECT"), c.c.Quote(pattern))
 	}
@@ -245,7 +266,7 @@ func (c *client) ListNew(mbox, pattern string) ([]uint32, error) {
 	if _, err = cmd.Result(imap.OK); err != nil {
 		return nil, err
 	}
-	Log.Debug("ListNew", "data", cmd.Data)
+	Log.Debug("List", "data", cmd.Data)
 	var uids []uint32
 	for _, resp := range cmd.Data {
 		uids = append(uids, resp.SearchResults()...)
